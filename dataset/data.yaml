@@ -1,0 +1,12 @@
+train: train/images
+val: train/images
+
+nc: 4
+names: ['angle', 'fracture', 'line', 'messed_up_angle']
+
+roboflow:
+  workspace: palaks-workspace-7ghdu
+  project: palaks-workspace-7ghdu
+  version: dataset
+  license: Private
+  url: https://app.roboflow.com/palaks-workspace-7ghdu/palaks-workspace-7ghdu/dataset
