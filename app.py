@@ -10,6 +10,12 @@ import cv2
 
 from report_utils import detect_bone_region, calculate_fracture_area
 
+# ── NEW: 3D pipeline imports ──────────────────────────────────────────────────
+import torch
+import io
+import os
+import tempfile
+
 # -----------------------------
 # PAGE CONFIG
 # -----------------------------
@@ -23,6 +29,115 @@ def load_model():
     return YOLO("best.pt")
 
 model = load_model()
+
+# ── NEW: Load MiDaS depth model ───────────────────────────────────────────────
+@st.cache_resource
+def load_depth_model():
+    midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+    midas.eval()
+    transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+    transform = transforms.small_transform
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    midas.to(device)
+    return midas, transform, device
+
+# ── NEW: 3D generation helpers ────────────────────────────────────────────────
+def estimate_depth(pil_image, midas, transform, device):
+    """Run MiDaS on a PIL image and return normalized depth map."""
+    img_rgb = np.array(pil_image.convert("RGB"))
+    input_batch = transform(img_rgb).to(device)
+    with torch.no_grad():
+        prediction = midas(input_batch)
+        prediction = torch.nn.functional.interpolate(
+            prediction.unsqueeze(1),
+            size=img_rgb.shape[:2],
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze()
+    depth = prediction.cpu().numpy()
+    depth = (depth - depth.min()) / (depth.max() - depth.min())
+    return depth, img_rgb
+
+
+def depth_to_pointcloud(depth_map, img_rgb, step=4):
+    """Convert depth map + image to open3d point cloud."""
+    import open3d as o3d
+    h, w = depth_map.shape
+    points, colors = [], []
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            z = float(depth_map[y, x])
+            if z < 0.15:
+                continue
+            nx = (x / w) * 2 - 1
+            ny = -((y / h) * 2 - 1)
+            nz = z * 0.6
+            points.append([nx, ny, nz])
+            r, g, b = img_rgb[y, x] / 255.0
+            colors.append([r, g, b])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.array(points))
+    pcd.colors = o3d.utility.Vector3dVector(np.array(colors))
+    return pcd
+
+
+def pointcloud_to_mesh(pcd):
+    """Poisson surface reconstruction → triangle mesh."""
+    import open3d as o3d
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30)
+    )
+    pcd.orient_normals_consistent_tangent_plane(100)
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=8)
+    density_array = np.asarray(densities)
+    keep = density_array > np.quantile(density_array, 0.05)
+    mesh.remove_vertices_by_mask(~keep)
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def mesh_to_glb_base64(mesh, fractures, img_w, img_h):
+    """Export mesh to .glb bytes, return base64 string."""
+    import trimesh
+    import trimesh.visual
+
+    vertices  = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+    normals   = np.asarray(mesh.vertex_normals)
+
+    # Default bone colour
+    vertex_colors = np.ones((len(vertices), 4), dtype=np.uint8) * [212, 201, 168, 230]
+
+    # Paint fracture zone vertices red
+    for f in fractures:
+        cx = (f["x1"] + f["x2"]) / 2 * 2 - 1
+        cy = -((f["y1"] + f["y2"]) / 2 * 2 - 1)
+        radius = max(f["x2"] - f["x1"], f["y2"] - f["y1"]) * 0.7
+        for i, v in enumerate(vertices):
+            if (v[0] - cx) ** 2 + (v[1] - cy) ** 2 < radius ** 2:
+                vertex_colors[i] = [226, 75, 74, 255]   # red
+
+    tm = trimesh.Trimesh(
+        vertices=vertices,
+        faces=triangles,
+        vertex_normals=normals,
+        vertex_colors=vertex_colors,
+        process=False,
+    )
+    buf = io.BytesIO()
+    tm.export(buf, file_type="glb")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def generate_3d_model(pil_image, fractures):
+    """Full pipeline: PIL image + fracture list → base64 GLB string."""
+    midas, transform, device = load_depth_model()
+    depth_map, img_rgb = estimate_depth(pil_image, midas, transform, device)
+    h, w = depth_map.shape
+    pcd  = depth_to_pointcloud(depth_map, img_rgb, step=4)
+    mesh = pointcloud_to_mesh(pcd)
+    glb_b64 = mesh_to_glb_base64(mesh, fractures, w, h)
+    return glb_b64
 
 # -----------------------------
 # LOAD GLB FILES
@@ -166,6 +281,41 @@ header, footer {visibility:hidden;}
 .small-space {
     height: 18px;
 }
+
+/* ── NEW: 3D viewer section ── */
+.viewer-3d-wrap {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 22px;
+    padding: 28px;
+    margin-top: 32px;
+}
+
+.viewer-3d-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: white;
+    margin-bottom: 6px;
+}
+
+.viewer-3d-sub {
+    font-size: 13px;
+    color: #64748b;
+    margin-bottom: 20px;
+    line-height: 1.6;
+}
+
+.fracture-badge {
+    display: inline-block;
+    padding: 5px 14px;
+    border-radius: 20px;
+    background: rgba(226,75,74,0.12);
+    border: 1px solid rgba(226,75,74,0.35);
+    color: #f09595;
+    font-size: 12px;
+    font-weight: 500;
+    margin-bottom: 16px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -230,8 +380,6 @@ if uploaded_file:
     if st.button("🔍 Analyze X-ray"):
         with st.spinner("Running AI Model..."):
 
-            import torch
-
             # YOLO Detection
             with torch.no_grad():
                 results = model(np.array(image))
@@ -240,15 +388,11 @@ if uploaded_file:
 
         st.markdown('<div class="big-space"></div>', unsafe_allow_html=True)
 
-        # -----------------------------
-        # 🔥 Generate Heatmap FIRST
-        # -----------------------------
+        # Generate Heatmap
         cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         gradcam_img = generate_gradcam(cv_image, results)
 
-        # -----------------------------
-        # Show Images (ALIGNED)
-        # -----------------------------
+        # Show Images
         st.markdown("## 📊 Visual Analysis Comparison")
 
         col1, col2, col3 = st.columns(3, gap="large")
@@ -265,30 +409,23 @@ if uploaded_file:
             st.markdown("### 🔥 Heatmap")
             st.image(gradcam_img, use_container_width=True)
 
-        # -----------------------------
         # Analysis
-        # -----------------------------
         st.markdown("## Analysis")
+
+        fractures_for_3d = []   # ← collect fracture data for 3D model
 
         if results[0].boxes is not None and len(results[0].boxes) > 0:
             st.error("⚠️ Fracture Detected")
 
             try:
-                # -----------------------------
-                # Confidence
-                # -----------------------------
                 conf = results[0].boxes.conf
-
                 if hasattr(conf, "cpu"):
                     conf = conf.cpu().numpy()
-
                 if isinstance(conf, (float, int, np.integer)):
                     score = round(float(conf) * 100, 2)
                 else:
                     score = round(float(np.max(conf)) * 100, 2)
-                # -----------------------------
-                # ⚠️ Severity Classification
-                # -----------------------------
+
                 if score > 80:
                     severity = "Severe"
                 elif score > 50:
@@ -296,9 +433,6 @@ if uploaded_file:
                 else:
                     severity = "Mild"
 
-                # -----------------------------
-                # 💊 Recommendations
-                # -----------------------------
                 if severity == "Severe":
                     recommendation = "Immediate medical attention required. Possible surgery or casting."
                     precautions = "Avoid movement. Immobilize immediately. Seek emergency care."
@@ -309,18 +443,27 @@ if uploaded_file:
                     recommendation = "Minor fracture suspected. Rest and monitoring recommended."
                     precautions = "Avoid strain. Apply ice. Monitor swelling."
 
-                # -----------------------------
-                # 🦴 Region + 📏 Area
-                # -----------------------------
                 boxes = results[0].boxes.xyxy
-
                 if hasattr(boxes, "cpu"):
                     boxes = boxes.cpu().numpy()
 
                 box = boxes[0]
-
                 region = detect_bone_region(box)
-                area = calculate_fracture_area(box, cv_image.shape)
+                area   = calculate_fracture_area(box, cv_image.shape)
+                img_h, img_w = cv_image.shape[:2]
+
+                # ── NEW: build normalized fracture list for 3D overlay ────────
+                for b in boxes:
+                    fractures_for_3d.append({
+                        "x1": float(b[0]) / img_w,
+                        "y1": float(b[1]) / img_h,
+                        "x2": float(b[2]) / img_w,
+                        "y2": float(b[3]) / img_h,
+                        "confidence": float(score / 100),
+                        "type": "Fracture",
+                        "region": region,
+                        "severity": severity,
+                    })
 
             except Exception as e:
                 st.warning(f"Processing issue: {e}")
@@ -328,22 +471,132 @@ if uploaded_file:
                 region = "Unknown"
                 area = 0
 
-            # -----------------------------
-            # Display
-            # -----------------------------
             st.metric("Confidence", f"{score}%")
             st.progress(int(score))
-
             st.write(f"🦴 Affected Region: {region}")
             st.write(f"📏 Fracture Area: {area}%")
 
         else:
             st.success("✅ No Fracture Detected")
-        
+
         st.write(f"⚠️ Severity: {severity}")
         st.write(f"💊 Recommendation: {recommendation}")
         st.write(f"🛑 Precautions: {precautions}")
-        
+
+        # ── NEW: 3D MODEL VIEWER ──────────────────────────────────────────────
+        st.markdown('<div class="big-space"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="viewer-3d-title">🧊 3D Bone Model</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="viewer-3d-sub">'
+            'A 3D model reconstructed from your X-ray using depth estimation. '
+            'The <span style="color:#f09595">red zone</span> shows the detected fracture region. '
+            'Rotate and zoom to explore. '
+            '<span style="color:#475569">This is an educational estimate, not a clinical scan.</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        col_left, col_right = st.columns([1.6, 1], gap="large")
+
+        with col_left:
+            with st.spinner("Generating 3D model from your X-ray... (this takes ~20–40 seconds)"):
+                try:
+                    glb_b64 = generate_3d_model(image, fractures_for_3d)
+                    components.html(f"""
+                    <script type="module" src="https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js"></script>
+                    <model-viewer
+                        src="data:model/gltf-binary;base64,{glb_b64}"
+                        auto-rotate
+                        camera-controls
+                        exposure="1.2"
+                        shadow-intensity="0.8"
+                        style="
+                            width: 100%;
+                            height: 420px;
+                            background: rgba(8,11,16,0.95);
+                            border-radius: 18px;
+                            border: 1px solid rgba(255,255,255,0.06);
+                        ">
+                        <div class="progress-bar hide" slot="progress-bar">
+                            <div class="update-bar"></div>
+                        </div>
+                    </model-viewer>
+                    """, height=440)
+
+                    # Download button
+                    glb_bytes = base64.b64decode(glb_b64)
+                    st.download_button(
+                        label="⬇️ Download 3D model (.glb)",
+                        data=glb_bytes,
+                        file_name="bone_fracture_model.glb",
+                        mime="model/gltf-binary",
+                    )
+
+                except Exception as e:
+                    st.error(f"3D generation failed: {e}")
+                    st.info("Install required packages: `pip install open3d trimesh`")
+
+        with col_right:
+            # Info panel matching your existing card style
+            st.markdown("""
+            <div style="
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.07);
+                border-radius: 18px;
+                padding: 22px;
+                height: 100%;
+            ">
+                <div style="font-size:13px;font-weight:600;color:#64748b;
+                            letter-spacing:.06em;text-transform:uppercase;margin-bottom:14px;">
+                    Model info
+                </div>
+
+                <div style="display:flex;flex-direction:column;gap:10px;">
+                    <div style="display:flex;justify-content:space-between;
+                                font-size:13px;padding:8px 0;
+                                border-bottom:1px solid rgba(255,255,255,0.05);">
+                        <span style="color:#64748b">Method</span>
+                        <span style="color:#e2e8f0;font-weight:500">MiDaS depth</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;
+                                font-size:13px;padding:8px 0;
+                                border-bottom:1px solid rgba(255,255,255,0.05);">
+                        <span style="color:#64748b">Mesh</span>
+                        <span style="color:#e2e8f0;font-weight:500">Poisson surface</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;
+                                font-size:13px;padding:8px 0;
+                                border-bottom:1px solid rgba(255,255,255,0.05);">
+                        <span style="color:#64748b">Fracture zone</span>
+                        <span style="color:#f09595;font-weight:500">Red overlay</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;
+                                font-size:13px;padding:8px 0;
+                                border-bottom:1px solid rgba(255,255,255,0.05);">
+                        <span style="color:#64748b">Format</span>
+                        <span style="color:#e2e8f0;font-weight:500">.glb (Three.js)</span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;
+                                font-size:13px;padding:8px 0;">
+                        <span style="color:#64748b">Purpose</span>
+                        <span style="color:#e2e8f0;font-weight:500">Patient education</span>
+                    </div>
+                </div>
+
+                <div style="margin-top:20px;padding:14px;border-radius:12px;
+                            background:rgba(226,75,74,0.08);
+                            border:1px solid rgba(226,75,74,0.2);">
+                    <div style="font-size:11px;color:#f09595;font-weight:500;margin-bottom:6px;">
+                        Clinical disclaimer
+                    </div>
+                    <div style="font-size:11px;color:#64748b;line-height:1.6;">
+                        This 3D model is an AI estimate from a 2D image.
+                        It is not a substitute for a CT scan or professional diagnosis.
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
 # -----------------------------
 # 3D MODEL SECTION
 # -----------------------------
@@ -937,9 +1190,6 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# -----------------------------
-# CARD WRAPPER (SMALLER)
-# -----------------------------
 def card_wrapper(step, title, desc, inner_html):
     return f"""
     <style>
@@ -1015,9 +1265,6 @@ def card_wrapper(step, title, desc, inner_html):
     </div>
     """
 
-# -----------------------------
-# CARD 1
-# -----------------------------
 def medical_data_card():
     inner = """
     <style>
@@ -1149,16 +1396,8 @@ def medical_data_card():
         </div>
     </div>
     """
-    return card_wrapper(
-        "Step 1",
-        "Medical Data Assessment",
-        "We analyze medical and clinical data to identify diagnostic needs and define AI goals.",
-        inner
-    )
+    return card_wrapper("Step 1","Medical Data Assessment","We analyze medical and clinical data to identify diagnostic needs and define AI goals.",inner)
 
-# -----------------------------
-# CARD 2
-# -----------------------------
 def ai_dev_card():
     inner = """
     <style>
@@ -1169,7 +1408,6 @@ def ai_dev_card():
         display: flex;
         flex-direction: column;
     }
-
     .topbar {
         height: 26px;
         background: rgba(255,255,255,0.04);
@@ -1180,12 +1418,7 @@ def ai_dev_card():
         color: #9ca3af;
         font-size: 11px;
     }
-
-    .code-body {
-        flex: 1;
-        display: flex;
-    }
-
+    .code-body { flex: 1; display: flex; }
     .sidebar {
         width: 34px;
         border-right: 1px solid rgba(255,255,255,0.05);
@@ -1197,54 +1430,21 @@ def ai_dev_card():
         color: #9ca3af;
         font-size: 13px;
     }
-
-    .editor {
-        flex: 1;
-        padding: 14px 16px;
-        color: white;
-        font-family: monospace;
-        font-size: 10px;
-        line-height: 1.7;
-    }
-
+    .editor { flex: 1; padding: 14px 16px; color: white; font-family: monospace; font-size: 10px; line-height: 1.7; }
     .pink { color: #d946ef; }
     .gray { color: #9ca3af; }
     .green { color: #d4d4d8; }
-
-    .cursor {
-        display: inline-block;
-        width: 6px;
-        height: 12px;
-        background: #d946ef;
-        margin-left: 4px;
-        animation: blink 1s infinite;
-        vertical-align: middle;
-    }
-
-    @keyframes blink {
-        50% { opacity: 0; }
-    }
+    .cursor { display: inline-block; width: 6px; height: 12px; background: #d946ef; margin-left: 4px; animation: blink 1s infinite; vertical-align: middle; }
+    @keyframes blink { 50% { opacity: 0; } }
     </style>
-
     <div class="code-window">
-        <div class="topbar">
-            <span>← →</span>
-            <span style="opacity:0.35;">──────────</span>
-            <span>□ － ×</span>
-        </div>
-
+        <div class="topbar"><span>← →</span><span style="opacity:0.35;">──────────</span><span>□ － ×</span></div>
         <div class="code-body">
-            <div class="sidebar">
-                <div>📄</div>
-                <div>🔍</div>
-                <div>🧩</div>
-            </div>
-
+            <div class="sidebar"><div>📄</div><div>🔍</div><div>🧩</div></div>
             <div class="editor">
                 <span class="pink">def __init__</span><span class="gray">(self, backbone='YOLOv8'):</span><br>
                 &nbsp;&nbsp;self.backbone = backbone<br>
                 &nbsp;&nbsp;self.explainability = "GradCAM"<br><br>
-
                 <span class="pink">def detect_fracture</span><span class="gray">(self, xray_image):</span><br>
                 &nbsp;&nbsp;<span class="green"># Model logic here</span><br>
                 &nbsp;&nbsp;return {<br>
@@ -1255,274 +1455,61 @@ def ai_dev_card():
         </div>
     </div>
     """
-    return card_wrapper(
-        "Step 2",
-        "AI Development",
-        "We build deep learning models for fracture detection using custom YOLOv8 and Grad-CAM.",
-        inner
-    )
+    return card_wrapper("Step 2","AI Development","We build deep learning models for fracture detection using custom YOLOv8 and Grad-CAM.",inner)
 
-# -----------------------------
-# CARD 3
-# -----------------------------
 def clinical_card():
     inner = """
     <style>
-    .flow-wrap {
-        width: 100%;
-        height: 100%;
-        position: relative;
-    }
-
-    .node {
-        position: absolute;
-        width: 58px;
-        height: 58px;
-        border-radius: 12px;
-        border: 1px solid rgba(255,255,255,0.08);
-        background: rgba(255,255,255,0.03);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: #f4f4f5;
-        font-size: 9px;
-        flex-direction: column;
-    }
-
-    .left-node {
-        left: 50px;
-        top: 52px;
-    }
-
-    .right-node {
-        right: 50px;
-        top: 52px;
-    }
-
-    .left-core, .right-core {
-        width: 24px;
-        height: 24px;
-        border-radius: 50%;
-        background: radial-gradient(circle, #d946ef 0%, #7e22ce 100%);
-        box-shadow: 0 0 18px rgba(217,70,239,0.5);
-        margin-bottom: 7px;
-        animation: pulseCore 2s infinite ease-in-out;
-    }
-
-    .right-core {
-        clip-path: polygon(0 0, 100% 0, 55% 50%, 100% 100%, 0 100%);
-        border-radius: 0;
-    }
-
-    .line {
-        position: absolute;
-        height: 2px;
-        background: linear-gradient(90deg, transparent, rgba(168,85,247,0.8), transparent);
-        background-size: 200% 100%;
-        animation: flow 2s linear infinite;
-    }
-
-    .l1 {
-        width: 130px;
-        left: 110px;
-        top: 78px;
-    }
-
-    .l2 {
-        width: 130px;
-        left: 110px;
-        top: 92px;
-    }
-
-    .l3 {
-        width: 130px;
-        left: 110px;
-        top: 106px;
-    }
-
-    .label {
-        position: absolute;
-        bottom: -20px;
-        color: #e4e4e7;
-        font-size: 9px;
-        width: 80px;
-        text-align: center;
-    }
-
+    .flow-wrap { width: 100%; height: 100%; position: relative; }
+    .node { position: absolute; width: 58px; height: 58px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.03); display: flex; align-items: center; justify-content: center; color: #f4f4f5; font-size: 9px; flex-direction: column; }
+    .left-node { left: 50px; top: 52px; }
+    .right-node { right: 50px; top: 52px; }
+    .left-core, .right-core { width: 24px; height: 24px; border-radius: 50%; background: radial-gradient(circle, #d946ef 0%, #7e22ce 100%); box-shadow: 0 0 18px rgba(217,70,239,0.5); margin-bottom: 7px; animation: pulseCore 2s infinite ease-in-out; }
+    .right-core { clip-path: polygon(0 0, 100% 0, 55% 50%, 100% 100%, 0 100%); border-radius: 0; }
+    .line { position: absolute; height: 2px; background: linear-gradient(90deg, transparent, rgba(168,85,247,0.8), transparent); background-size: 200% 100%; animation: flow 2s linear infinite; }
+    .l1 { width: 130px; left: 110px; top: 78px; }
+    .l2 { width: 130px; left: 110px; top: 92px; }
+    .l3 { width: 130px; left: 110px; top: 106px; }
+    .label { position: absolute; bottom: -20px; color: #e4e4e7; font-size: 9px; width: 80px; text-align: center; }
     .label.left { left: -12px; }
     .label.right { left: -12px; }
-
-    @keyframes flow {
-        0% { background-position: 200% 0; }
-        100% { background-position: -200% 0; }
-    }
-
-    @keyframes pulseCore {
-        0%,100% { transform: scale(1); opacity: 0.9; }
-        50% { transform: scale(1.12); opacity: 1; }
-    }
+    @keyframes flow { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+    @keyframes pulseCore { 0%,100% { transform: scale(1); opacity: 0.9; } 50% { transform: scale(1.12); opacity: 1; } }
     </style>
-
     <div class="flow-wrap">
-        <div class="line l1"></div>
-        <div class="line l2"></div>
-        <div class="line l3"></div>
-
-        <div class="node left-node">
-            <div class="left-core"></div>
-            <div class="label left">BoneView</div>
-        </div>
-
-        <div class="node right-node">
-            <div class="right-core"></div>
-            <div class="label right">Hospital AI</div>
-        </div>
+        <div class="line l1"></div><div class="line l2"></div><div class="line l3"></div>
+        <div class="node left-node"><div class="left-core"></div><div class="label left">BoneView</div></div>
+        <div class="node right-node"><div class="right-core"></div><div class="label right">Hospital AI</div></div>
     </div>
     """
-    return card_wrapper(
-        "Step 3",
-        "Clinical Integration",
-        "We integrate AI into radiology workflows and ensure compatibility with hospital systems.",
-        inner
-    )
+    return card_wrapper("Step 3","Clinical Integration","We integrate AI into radiology workflows and ensure compatibility with hospital systems.",inner)
 
-# -----------------------------
-# CARD 4
-# -----------------------------
 def insights_card():
     inner = """
     <style>
-    .status-wrap {
-        width: 100%;
-        height: 100%;
-        padding: 12px;
-        box-sizing: border-box;
-        display: flex;
-        flex-direction: column;
-        gap: 9px;
-        justify-content: center;
-    }
-
-    .status-card {
-        border: 1px solid rgba(255,255,255,0.07);
-        background: rgba(255,255,255,0.02);
-        border-radius: 10px;
-        padding: 10px 12px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        color: white;
-    }
-
-    .left-side {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-    }
-
-    .mini-icon {
-        width: 22px;
-        height: 22px;
-        border-radius: 8px;
-        border: 1px solid rgba(255,255,255,0.08);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: #d4d4d8;
-        font-size: 11px;
-    }
-
-    .main {
-        font-size: 11px;
-        font-weight: 600;
-        color: #f4f4f5;
-    }
-
-    .sub {
-        font-size: 10px;
-        color: #a1a1aa;
-        margin-top: 2px;
-    }
-
-    .circle-loader {
-        width: 13px;
-        height: 13px;
-        border-radius: 50%;
-        border: 3px solid rgba(217,70,239,0.15);
-        border-top-color: #d946ef;
-        animation: spin 1s linear infinite;
-    }
-
-    .up-arrow {
-        color: #d946ef;
-        font-size: 15px;
-        animation: floatUp 1.4s infinite ease-in-out;
-    }
-
-    .tick {
-        color: #d946ef;
-        font-size: 17px;
-    }
-
-    @keyframes spin {
-        to { transform: rotate(360deg); }
-    }
-
-    @keyframes floatUp {
-        0%,100% { transform: translateY(0); }
-        50% { transform: translateY(-3px); }
-    }
+    .status-wrap { width: 100%; height: 100%; padding: 12px; box-sizing: border-box; display: flex; flex-direction: column; gap: 9px; justify-content: center; }
+    .status-card { border: 1px solid rgba(255,255,255,0.07); background: rgba(255,255,255,0.02); border-radius: 10px; padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; color: white; }
+    .left-side { display: flex; align-items: center; gap: 10px; }
+    .mini-icon { width: 22px; height: 22px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.08); display: flex; align-items: center; justify-content: center; color: #d4d4d8; font-size: 11px; }
+    .main { font-size: 11px; font-weight: 600; color: #f4f4f5; }
+    .sub { font-size: 10px; color: #a1a1aa; margin-top: 2px; }
+    .circle-loader { width: 13px; height: 13px; border-radius: 50%; border: 3px solid rgba(217,70,239,0.15); border-top-color: #d946ef; animation: spin 1s linear infinite; }
+    .up-arrow { color: #d946ef; font-size: 15px; animation: floatUp 1.4s infinite ease-in-out; }
+    .tick { color: #d946ef; font-size: 17px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes floatUp { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
     </style>
-
     <div class="status-wrap">
-        <div class="status-card">
-            <div class="left-side">
-                <div class="mini-icon">💬</div>
-                <div>
-                    <div class="main">Chatbot system</div>
-                    <div class="sub">Efficiency will increase by 20%</div>
-                </div>
-            </div>
-            <div class="circle-loader"></div>
-        </div>
-
-        <div class="status-card">
-            <div class="left-side">
-                <div class="mini-icon">⚙️</div>
-                <div>
-                    <div class="main">Workflow system</div>
-                    <div class="sub">Update available.</div>
-                </div>
-            </div>
-            <div class="up-arrow">↑</div>
-        </div>
-
-        <div class="status-card">
-            <div class="left-side">
-                <div class="mini-icon">⚗</div>
-                <div>
-                    <div class="main">Sales system</div>
-                    <div class="sub">Up to date</div>
-                </div>
-            </div>
-            <div class="tick">✓</div>
-        </div>
+        <div class="status-card"><div class="left-side"><div class="mini-icon">💬</div><div><div class="main">Chatbot system</div><div class="sub">Efficiency will increase by 20%</div></div></div><div class="circle-loader"></div></div>
+        <div class="status-card"><div class="left-side"><div class="mini-icon">⚙️</div><div><div class="main">Workflow system</div><div class="sub">Update available.</div></div></div><div class="up-arrow">↑</div></div>
+        <div class="status-card"><div class="left-side"><div class="mini-icon">⚗</div><div><div class="main">Sales system</div><div class="sub">Up to date</div></div></div><div class="tick">✓</div></div>
     </div>
     """
-    return card_wrapper(
-        "Step 4",
-        "Real-Time Insights & Feedback",
-        "We monitor AI in real-world use, collect feedback, and optimize for higher accuracy.",
-        inner
-    )
+    return card_wrapper("Step 4","Real-Time Insights & Feedback","We monitor AI in real-world use, collect feedback, and optimize for higher accuracy.",inner)
 
-# -----------------------------
-# WORKFLOW GRID WITH SCROLL REVEAL
-# -----------------------------
 col1, col2 = st.columns(2, gap="large")
 with col1:
     components.html(reveal_wrapper(medical_data_card(), 390), height=390)
-
 with col2:
     components.html(reveal_wrapper(ai_dev_card(), 390), height=390)
 
@@ -1531,7 +1518,6 @@ st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 col3, col4 = st.columns(2, gap="large")
 with col3:
     components.html(reveal_wrapper(clinical_card(), 390), height=390)
-
 with col4:
     components.html(reveal_wrapper(insights_card(), 390), height=390)
 
